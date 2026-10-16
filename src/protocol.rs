@@ -37,6 +37,22 @@ pub fn client(timeout: Duration, connect_timeout: Duration) -> Agent {
         .into()
 }
 
+// 走指定出口代理的 Agent。每个出口一个 Agent，连接池互相隔离，
+// 避免复用连接时把请求又带回上一个 IP。
+pub fn client_with_proxy(
+    timeout: Duration,
+    connect_timeout: Duration,
+    proxy: ureq::Proxy,
+) -> Agent {
+    Agent::config_builder()
+        .timeout_global(Some(timeout))
+        .timeout_connect(Some(connect_timeout))
+        .http_status_as_error(false)
+        .proxy(Some(proxy))
+        .build()
+        .into()
+}
+
 // session ID 格式：`ses_` + descending() 时间戳低 48 位 hex(12) + 14 位 base62。
 // 上游会校验首 12 hex 是 ~(timestamp*0x1000+counter)，乱填一律 403 FreeTier。
 pub fn opencode_session_id(timestamp_ms: u64) -> String {

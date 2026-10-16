@@ -19,6 +19,7 @@ use ureq::Agent;
 
 mod convert;
 mod keepalive;
+mod pool;
 mod protocol;
 mod routes;
 
@@ -27,10 +28,11 @@ use crate::convert::{
     is_stream_request, json_response, response, thinking_mode, transform_stream_body,
 };
 use crate::keepalive::{primary_ip, public_ip, spawn_session_keepalive, unix_now};
+use crate::pool::ProxyPool;
 use crate::protocol::{
     MAX_BODY_BYTES, UpstreamError, UpstreamResponse, add_headers, add_v2_session_headers,
-    add_token, client, env_flag, env_or, env_seconds, gate_tool, read_body_response,
-    request_header, split_nodes,
+    add_token, client, client_with_proxy, env_flag, env_or, env_seconds, gate_tool,
+    read_body_response, request_header, split_nodes,
 };
 use crate::routes::{
     is_chat_path, is_claude_models_path, is_health_path, is_models_path, normalize_path,
@@ -51,6 +53,11 @@ pub struct App {
     pub free_map: Arc<Mutex<FreeMap>>,
     pub client: Agent,
     pub stream_client: Agent,
+    // 出口代理池。为空时直接直连（原行为）。
+    pub pool: Arc<ProxyPool>,
+    // 与 pool 中的出口一一对应的 Agent，按下标取用；每个出口独立连接池。
+    pub pooled_clients: Arc<Vec<Agent>>,
+    pub pooled_stream_clients: Arc<Vec<Agent>>,
     pub requests: Arc<AtomicU64>,
     pub port: String,
     pub local_ip: String,
@@ -82,6 +89,20 @@ impl App {
             nodes
         };
         let port = env_or("PORT", "8788");
+        let pool = ProxyPool::from_env();
+        let upstream_timeout = env_seconds("UPSTREAM_TIMEOUT", 90);
+        let stream_timeout = env_seconds("STREAM_TIMEOUT", 1800);
+        // 每个出口一个 Agent，连接池按出口隔离。
+        let pooled_clients: Vec<Agent> = (0..pool.len())
+            .map(|index| {
+                client_with_proxy(upstream_timeout, connect_timeout, pool.proxy_at(index))
+            })
+            .collect();
+        let pooled_stream_clients: Vec<Agent> = (0..pool.len())
+            .map(|index| {
+                client_with_proxy(stream_timeout, connect_timeout, pool.proxy_at(index))
+            })
+            .collect();
         App {
             nodes,
             token: env::var("API_TOKEN").ok().filter(|value| !value.is_empty()),
@@ -90,8 +111,11 @@ impl App {
                 .filter(|value| !value.is_empty()),
             strip_free: env_flag("STRIP_FREE"),
             free_map: Arc::new(Mutex::new(FreeMap::new())),
-            client: client(env_seconds("UPSTREAM_TIMEOUT", 90), connect_timeout),
-            stream_client: client(env_seconds("STREAM_TIMEOUT", 1800), connect_timeout),
+            client: client(upstream_timeout, connect_timeout),
+            stream_client: client(stream_timeout, connect_timeout),
+            pool: Arc::new(pool),
+            pooled_clients: Arc::new(pooled_clients),
+            pooled_stream_clients: Arc::new(pooled_stream_clients),
             requests: Arc::new(AtomicU64::new(0)),
             port,
             local_ip: primary_ip().unwrap_or_else(|| "127.0.0.1".to_owned()),
@@ -176,6 +200,12 @@ impl App {
                     "status": "ok",
                     "nodes": self.nodes,
                     "requests": self.requests.load(Ordering::Relaxed),
+                    // 出口池只报数量与可用数，不暴露代理地址。
+                    "proxy_pool": {
+                        "exits": self.pool.len(),
+                        "available": self.pool.available(),
+                        "cooldown_secs": self.pool.cooldown().as_secs(),
+                    },
                     "port": self.port,
                     "local_ip": self.local_ip,
                     "public_ip": self.public_ip,
@@ -514,6 +544,37 @@ impl App {
 }
 
 impl App {
+    // 取一次请求要用的 Agent：配了代理池就轮询分配出口，否则回落到直连 Agent。
+    // 返回 (agent, 出口下标)；下标仅对走代理的情况有意义。
+    fn pick_agent(&self, stream: bool) -> (Agent, Option<usize>) {
+        if self.pool.is_empty() {
+            let agent = if stream {
+                self.stream_client.clone()
+            } else {
+                self.client.clone()
+            };
+            return (agent, None);
+        }
+        match self.pool.acquire() {
+            Some((index, _)) => {
+                let agent = if stream {
+                    self.pooled_stream_clients[index].clone()
+                } else {
+                    self.pooled_clients[index].clone()
+                };
+                (agent, Some(index))
+            }
+            None => {
+                let agent = if stream {
+                    self.stream_client.clone()
+                } else {
+                    self.client.clone()
+                };
+                (agent, None)
+            }
+        }
+    }
+
     fn upstream(
         &self,
         path: &str,
@@ -529,68 +590,89 @@ impl App {
                 body: Vec::new(),
             });
         }
-        let agent = if stream {
-            &self.stream_client
-        } else {
-            &self.client
-        };
         let mut failures = Vec::with_capacity(self.nodes.len());
-        for node in &self.nodes {
-            let url = format!("{node}{path}");
-            let outcome = match method {
-                Method::Post => {
-                    let builder = add_headers(agent.post(&url), accept, &self.token);
-                    let builder = if stream {
-                        add_v2_session_headers(builder, &self.token)
-                    } else {
-                        builder
-                    };
-                    builder
-                        .header("Content-Type", "application/json")
-                        .send(&body)
-                        .map(read_body_response)
-                }
-                Method::Get => {
-                    let builder = add_headers(agent.get(&url), accept, &self.token);
-                    let builder = if path == "/models" {
-                        builder.header("Accept", "application/json")
-                    } else {
-                        builder
-                    };
-                    builder.call().map(read_body_response)
-                }
-                _ => continue,
-            };
-            match outcome {
-                Ok(response) => {
-                    if !response.status().is_success() {
-                        let status = response.status();
-                        let body_bytes = response.into_body();
-                        let body_str = String::from_utf8_lossy(&body_bytes).trim().to_owned();
-                        let message = if body_str.is_empty() {
-                            format!("{node}: HTTP {status}")
+        // 429 表示该出口 IP 的配额/速率被限流，换个出口重试；最多把池子轮一遍。
+        // 每个出口内部仍按 NODES 顺序做故障转移。
+        let attempts = self.pool.len().max(1);
+        for _ in 0..attempts {
+            let (agent, proxy_index) = self.pick_agent(stream);
+            for node in &self.nodes {
+                let url = format!("{node}{path}");
+                let outcome = match method {
+                    Method::Post => {
+                        let builder = add_headers(agent.post(&url), accept, &self.token);
+                        let builder = if stream {
+                            add_v2_session_headers(builder, &self.token)
                         } else {
-                            format!("{node}: HTTP {status} - {body_str}")
+                            builder
                         };
-                        eprintln!("上游请求失败 {message}");
-                        if status.is_client_error() {
-                            return Err(UpstreamError {
-                                status: status.as_u16(),
-                                message,
-                                body: body_bytes,
-                            });
+                        builder
+                            .header("Content-Type", "application/json")
+                            .send(&body)
+                            .map(read_body_response)
+                    }
+                    Method::Get => {
+                        let builder = add_headers(agent.get(&url), accept, &self.token);
+                        let builder = if path == "/models" {
+                            builder.header("Accept", "application/json")
+                        } else {
+                            builder
+                        };
+                        builder.call().map(read_body_response)
+                    }
+                    _ => continue,
+                };
+                match outcome {
+                    Ok(response) => {
+                        if !response.status().is_success() {
+                            let status = response.status();
+                            let body_bytes = response.into_body();
+                            let body_str = String::from_utf8_lossy(&body_bytes).trim().to_owned();
+                            let message = if body_str.is_empty() {
+                                format!("{node}: HTTP {status}")
+                            } else {
+                                format!("{node}: HTTP {status} - {body_str}")
+                            };
+                            eprintln!("上游请求失败 {message}");
+                            // 429：给这个出口打冷却标记，换下一个出口继续尝试。
+                            if status.as_u16() == 429 {
+                                if let Some(index) = proxy_index {
+                                    self.pool.penalize(index);
+                                    eprintln!("出口 {index} 被限流，冷却后切换下一个出口");
+                                    failures.push(message);
+                                    break;
+                                }
+                            }
+                            if status.is_client_error() {
+                                return Err(UpstreamError {
+                                    status: status.as_u16(),
+                                    message,
+                                    body: body_bytes,
+                                });
+                            }
+                            failures.push(message);
+                            continue;
                         }
-                        failures.push(message);
-                        continue;
+                        if stream {
+                            eprintln!("正在通过 {node} 流式转发 {path}");
+                        }
+                        return Ok(response);
                     }
-                    if stream {
-                        eprintln!("正在通过 {node} 流式转发 {path}");
+                    Err(error) => {
+                        eprintln!("上游请求失败 {node}: {error}");
+                        // 代理自身被限流时，ureq 把 CONNECT 阶段的 429 报成传输层错误
+                        // （"proxy server responded 429"），拿不到 http::StatusCode。
+                        // 这种同样说明该出口已不可用，按限流处理并换出口。
+                        if let Some(index) = proxy_index {
+                            if is_rate_limited(&error) {
+                                self.pool.penalize(index);
+                                eprintln!("出口 {index} 被限流，冷却后切换下一个出口");
+                                failures.push(format!("{node}: {error}"));
+                                break;
+                            }
+                        }
+                        failures.push(format!("{node}: {error}"));
                     }
-                    return Ok(response);
-                }
-                Err(error) => {
-                    eprintln!("上游请求失败 {node}: {error}");
-                    failures.push(format!("{node}: {error}"));
                 }
             }
         }
@@ -617,33 +699,52 @@ impl App {
             return bad_request();
         }
         let target = route_upstream_path(full_path);
-        for node in &self.nodes {
-            let url = format!("{node}{target}");
-            let result = self.call_with_method(method, &url, &body);
-            match result {
-                Ok(response) => {
-                    let status = response.status().as_u16();
-                    let content_type = response
-                        .headers()
-                        .get("Content-Type")
-                        .and_then(|value| value.to_str().ok())
-                        .map(str::to_owned)
-                        .unwrap_or_else(|| "application/json; charset=utf-8".to_owned());
-                    let body = response.into_body();
-                    let mut headers = vec![header("Cache-Control", "no-cache")];
-                    headers.push(header("Content-Type", &content_type));
-                    append_cors(&mut headers);
-                    return Response::new(
-                        StatusCode(status),
-                        headers,
-                        Cursor::new(body),
-                        None,
-                        None,
-                    )
-                    .boxed();
-                }
-                Err(error) => {
-                    eprintln!("上游请求失败 {node}: {error}");
+        // 与 upstream 一致：429 换出口重试，其余失败按 NODES 顺序故障转移。
+        let attempts = self.pool.len().max(1);
+        for _ in 0..attempts {
+            let (agent, proxy_index) = self.pick_agent(true);
+            for node in &self.nodes {
+                let url = format!("{node}{target}");
+                let result = self.call_with_method(&agent, method, &url, &body);
+                match result {
+                    Ok(response) => {
+                        let status = response.status().as_u16();
+                        if status == 429 {
+                            if let Some(index) = proxy_index {
+                                self.pool.penalize(index);
+                                eprintln!("出口 {index} 被限流，冷却后切换下一个出口");
+                                break;
+                            }
+                        }
+                        let content_type = response
+                            .headers()
+                            .get("Content-Type")
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| "application/json; charset=utf-8".to_owned());
+                        let body = response.into_body();
+                        let mut headers = vec![header("Cache-Control", "no-cache")];
+                        headers.push(header("Content-Type", &content_type));
+                        append_cors(&mut headers);
+                        return Response::new(
+                            StatusCode(status),
+                            headers,
+                            Cursor::new(body),
+                            None,
+                            None,
+                        )
+                        .boxed();
+                    }
+                    Err(error) => {
+                        eprintln!("上游请求失败 {node}: {error}");
+                        if let Some(index) = proxy_index {
+                            if is_rate_limited(&error) {
+                                self.pool.penalize(index);
+                                eprintln!("出口 {index} 被限流，冷却后切换下一个出口");
+                                break;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -652,11 +753,11 @@ impl App {
 
     fn call_with_method(
         &self,
+        agent: &Agent,
         method: &Method,
         url: &str,
         body: &[u8],
     ) -> Result<UpstreamResponse, ureq::Error> {
-        let agent = &self.stream_client;
         let response = match method {
             Method::Post | Method::Put | Method::Patch => {
                 let builder = match method {
@@ -675,8 +776,14 @@ impl App {
     }
 }
 
-fn proxy_response(upstream: UpstreamResponse) -> ResponseBox {
-    let status = upstream.status().as_u16();
+// 判断传输层错误是否由限流引起。ureq 在 CONNECT 隧道阶段收到 429 时不会给出
+// StatusCode，只能从错误文本里识别；同时覆盖上游直接回 429 的情况。
+fn is_rate_limited(error: &ureq::Error) -> bool {
+    let text = error.to_string().to_lowercase();
+    text.contains("429") || text.contains("too many requests") || text.contains("rate limit")
+}
+
+fn proxy_response(upstream: UpstreamResponse) -> ResponseBox {    let status = upstream.status().as_u16();
     let content_type = upstream
         .headers()
         .get("Content-Type")
@@ -784,6 +891,9 @@ mod tests {
             free_map: Arc::new(Mutex::new(FreeMap::new())),
             client: client(Duration::from_secs(15), Duration::from_secs(15)),
             stream_client: client(Duration::from_secs(15), Duration::from_secs(15)),
+            pool: Arc::new(ProxyPool::new(Vec::new(), Duration::from_secs(60))),
+            pooled_clients: Arc::new(Vec::new()),
+            pooled_stream_clients: Arc::new(Vec::new()),
             requests: Arc::new(AtomicU64::new(0)),
             port: "8788".to_owned(),
             local_ip: "127.0.0.1".to_owned(),
@@ -959,8 +1069,21 @@ mod tests {
         assert_eq!(parsed["reasoning_effort"], json!("low"));
     }
 
-    fn remap_gate_read_names(tools: &Value) -> Vec<String> {
-        tools
+    // 代理在 CONNECT 阶段被限流时，ureq 报的是传输层错误而非 HTTP 响应，
+    // 所以要从错误文本里识别限流，否则出口不会被冷却。
+    #[test]
+    fn detects_rate_limit_from_transport_error_text() {
+        let connect_429 = ureq::Error::Io(std::io::Error::other(
+            "CONNECT proxy failed: proxy server responded 429/429",
+        ));
+        assert!(is_rate_limited(&connect_429));
+        let too_many = ureq::Error::Io(std::io::Error::other("Too Many Requests"));
+        assert!(is_rate_limited(&too_many));
+        let unrelated = ureq::Error::Io(std::io::Error::other("connection reset by peer"));
+        assert!(!is_rate_limited(&unrelated));
+    }
+
+    fn remap_gate_read_names(tools: &Value) -> Vec<String> {        tools
             .as_array()
             .expect("tools should be an array")
             .iter()

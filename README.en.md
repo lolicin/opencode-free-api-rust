@@ -30,6 +30,8 @@ The console prints three addresses on startup (loopback / LAN / public). Point a
 | `HOST` | `0.0.0.0` | Bind address |
 | `PORT` | `8788` | Bind port |
 | `NODES` | `https://opencode.ai/zen/v1` | Comma-separated upstream base URLs; defaults to the official OpenCode Zen gateway |
+| `PROXIES` | unset | Comma-separated egress proxies (`http://`/`https://`/`socks5://` or `host:port`). The upstream rate-limits by egress IP (RPM and time-window quota); when set, requests are round-robined across multiple egress IPs |
+| `PROXY_COOLDOWN` | `60` | Seconds an egress is cooled down after being rate-limited (429); a cooling egress is not selected |
 | `API_TOKEN` | unset | Optional Bearer token sent to each upstream; unset means no Authorization header is sent (fill in your Zen key) |
 | `AUTH_TOKEN` | unset | If set, requests must carry `Authorization: Bearer <value>` (`/health` and preflight exempt) |
 | `STRIP_FREE` | off | Strip the `-free` suffix from model IDs in `/v1/models` and map calls back to the real ID |
@@ -45,11 +47,28 @@ AUTH_TOKEN=my-secret \
 ./opencode-free-api
 ```
 
+### Spreading rate limits across egress IPs
+
+The upstream applies free-tier RPM and time-window quotas per **egress IP**, so a single IP hits the ceiling easily. Set `PROXIES` to round-robin requests across several egress IPs; when one is rate-limited it is cooled down and traffic moves to the others:
+
+```sh
+PROXIES=http://user:pass@proxy-a.example:8080,http://proxy-b.example:8080,socks5://proxy-c.example:1080 \
+PROXY_COOLDOWN=60 \
+./opencode-free-api
+```
+
+Behaviour:
+
+- Each egress gets its own connection pool, so a reused connection never carries a request back out of the previous IP.
+- On 429 (either a direct response or a proxy rejecting the CONNECT tunnel) that egress is cooled down while the rest keep serving. If every egress is cooling, the one recovering soonest is used rather than failing outright.
+- Unparsable entries are skipped and the remaining egresses are kept. `/health` reports `proxy_pool` with the total/available egress count and the cooldown length (proxy addresses are not exposed).
+- With `PROXIES` unset, the proxy connects directly, exactly as before.
+
 ## API
 
 | Method | Path | Description |
 | --- | --- | --- |
-| `GET` | `/health` `/healthz` `/ready` `/api/health` `/api/status` | Health check & stats (request count, listen addresses, start time) |
+| `GET` | `/health` `/healthz` `/ready` `/api/health` `/api/status` | Health check & stats (request count, listen addresses, start time, egress pool state) |
 | `GET` | `/v1/models` | Free model list — only `*-free` models from the upstream |
 | `GET` | `/claude/v1/models` `/anthropic/v1/models` | Claude-compatible model list |
 | `POST` | `/v1/chat/completions` | Chat completions, streaming SSE supported |

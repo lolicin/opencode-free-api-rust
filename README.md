@@ -30,6 +30,8 @@ _✨ OpenAI 兼容反代 · 单文件部署 ✨_
 | `HOST` | `0.0.0.0` | 绑定地址 |
 | `PORT` | `8788` | 绑定端口 |
 | `NODES` | `https://opencode.ai/zen/v1` | 逗号分隔的上游基础 URL，默认官方 OpenCode Zen 网关 |
+| `PROXIES` | 未设置 | 逗号分隔的出口代理（`http://`/`https://`/`socks5://` 或 `host:port`）。上游按出口 IP 限流（RPM 与时间窗额度），配置后请求按轮询分摊到多个出口 IP |
+| `PROXY_COOLDOWN` | `60` | 某出口被限流（429）后的冷却秒数，冷却期内不再选中该出口 |
 | `API_TOKEN` | 未设置 | 发往上游的可选 Bearer 令牌，未设置时不发送 Authorization 请求头（填你的 Zen Key） |
 | `AUTH_TOKEN` | 未设置 | 设置后请求须携带 `Authorization: Bearer <value>`（`/health` 与预检除外） |
 | `STRIP_FREE` | off | 去掉 `/v1/models` 返回 ID 的 `-free` 后缀，调用时映射回真实 ID |
@@ -45,11 +47,28 @@ AUTH_TOKEN=my-secret \
 ./opencode-free-api
 ```
 
+### 多出口分摊限流
+
+上游对免费层的 RPM 与时间窗额度按**出口 IP** 判定，单 IP 很容易触顶。配置 `PROXIES` 后，请求按轮询分摊到多个出口 IP，单个出口被限流时自动冷却并切换到其他出口：
+
+```sh
+PROXIES=http://user:pass@proxy-a.example:8080,http://proxy-b.example:8080,socks5://proxy-c.example:1080 \
+PROXY_COOLDOWN=60 \
+./opencode-free-api
+```
+
+行为说明：
+
+- 每个出口使用独立的连接池，避免复用连接把请求带回上一个 IP。
+- 出口被限流时（HTTP 429，或代理在 CONNECT 阶段返回 429）进入冷却期，其余出口继续承接流量；全部出口都在冷却时退化为选用「最早恢复」的那个，不会直接断流。
+- 出口列表无法解析的条目会被忽略并保留其余可用出口；`/health` 的 `proxy_pool` 字段报告出口总数、当前可用数与冷却时长（不暴露代理地址）。
+- 未配置 `PROXIES` 时完全走直连，行为与之前一致。
+
 ## API
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| `GET` | `/health` `/healthz` `/ready` `/api/health` `/api/status` | 健康检查与统计（请求数、监听地址、启动时间） |
+| `GET` | `/health` `/healthz` `/ready` `/api/health` `/api/status` | 健康检查与统计（请求数、监听地址、启动时间、出口池状态） |
 | `GET` | `/v1/models` | 免费模型列表，仅暴露上游 `*-free` 模型 |
 | `GET` | `/claude/v1/models` `/anthropic/v1/models` | Claude 兼容模型列表 |
 | `POST` | `/v1/chat/completions` | 对话补全，支持流式 SSE |
