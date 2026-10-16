@@ -92,16 +92,16 @@ impl App {
         let pool = ProxyPool::from_env();
         let upstream_timeout = env_seconds("UPSTREAM_TIMEOUT", 90);
         let stream_timeout = env_seconds("STREAM_TIMEOUT", 1800);
-        // 每个出口一个 Agent，连接池按出口隔离。
+        // 每个出口一个 Agent，连接池按出口隔离；直连出口用不带 proxy 的 Agent。
+        let build = |timeout: Duration, index: usize| match pool.proxy_at(index) {
+            Some(proxy) => client_with_proxy(timeout, connect_timeout, proxy),
+            None => client(timeout, connect_timeout),
+        };
         let pooled_clients: Vec<Agent> = (0..pool.len())
-            .map(|index| {
-                client_with_proxy(upstream_timeout, connect_timeout, pool.proxy_at(index))
-            })
+            .map(|index| build(upstream_timeout, index))
             .collect();
         let pooled_stream_clients: Vec<Agent> = (0..pool.len())
-            .map(|index| {
-                client_with_proxy(stream_timeout, connect_timeout, pool.proxy_at(index))
-            })
+            .map(|index| build(stream_timeout, index))
             .collect();
         App {
             nodes,
@@ -556,7 +556,7 @@ impl App {
             return (agent, None);
         }
         match self.pool.acquire() {
-            Some((index, _)) => {
+            Some(index) => {
                 let agent = if stream {
                     self.pooled_stream_clients[index].clone()
                 } else {
@@ -638,7 +638,10 @@ impl App {
                             if status.as_u16() == 429 {
                                 if let Some(index) = proxy_index {
                                     self.pool.penalize(index);
-                                    eprintln!("出口 {index} 被限流，冷却后切换下一个出口");
+                                    eprintln!(
+                                        "出口 {} 被限流，冷却后切换下一个出口",
+                                        self.pool.entry_at(index).url
+                                    );
                                     failures.push(message);
                                     break;
                                 }
@@ -666,7 +669,10 @@ impl App {
                         if let Some(index) = proxy_index {
                             if is_rate_limited(&error) {
                                 self.pool.penalize(index);
-                                eprintln!("出口 {index} 被限流，冷却后切换下一个出口");
+                                eprintln!(
+                                    "出口 {} 被限流，冷却后切换下一个出口",
+                                    self.pool.entry_at(index).url
+                                );
                                 failures.push(format!("{node}: {error}"));
                                 break;
                             }
@@ -712,7 +718,10 @@ impl App {
                         if status == 429 {
                             if let Some(index) = proxy_index {
                                 self.pool.penalize(index);
-                                eprintln!("出口 {index} 被限流，冷却后切换下一个出口");
+                                eprintln!(
+                                    "出口 {} 被限流，冷却后切换下一个出口",
+                                    self.pool.entry_at(index).url
+                                );
                                 break;
                             }
                         }
@@ -740,7 +749,10 @@ impl App {
                         if let Some(index) = proxy_index {
                             if is_rate_limited(&error) {
                                 self.pool.penalize(index);
-                                eprintln!("出口 {index} 被限流，冷却后切换下一个出口");
+                                eprintln!(
+                                    "出口 {} 被限流，冷却后切换下一个出口",
+                                    self.pool.entry_at(index).url
+                                );
                                 break;
                             }
                         }

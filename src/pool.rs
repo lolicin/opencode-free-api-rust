@@ -1,6 +1,6 @@
-// 出口代理池：上游限流（RPM 与时间窗额度）按出口 IP 判定，用代理池把请求
-// 摊到多个出口 IP 上。轮询选路；某个出口被限流（429）时就地冷却，
-// 冷却期内不再选中它，请求改由其余代理承担。
+// 出口池：上游限流（RPM 与时间窗额度）按出口 IP 判定，用多个出口把请求摊开。
+// 轮询选路；某个出口被限流（429）时就地冷却，冷却期内不再选中它，
+// 请求改由其余出口承担。出口可以是直连（proxy = None），也可以是代理。
 use std::{
     env,
     sync::{
@@ -12,10 +12,25 @@ use std::{
 
 use ureq::Proxy;
 
+// 一个出口。proxy 为 None 表示直连（本机出口 IP）。
 #[derive(Debug, Clone)]
 pub struct ProxyEntry {
     pub url: String,
-    pub proxy: Proxy,
+    pub proxy: Option<Proxy>,
+}
+
+impl ProxyEntry {
+    // 直连出口，显示名用于日志。
+    pub fn direct() -> Self {
+        Self {
+            url: "direct".to_owned(),
+            proxy: None,
+        }
+    }
+
+    pub fn is_direct(&self) -> bool {
+        self.proxy.is_none()
+    }
 }
 
 pub struct ProxyPool {
@@ -41,10 +56,16 @@ impl ProxyPool {
 
     pub fn from_env() -> Self {
         let cooldown = env_seconds("PROXY_COOLDOWN", 60);
-        Self::new(
-            parse_proxies(&env::var("PROXIES").unwrap_or_default()),
-            cooldown,
-        )
+        let proxies = parse_proxies(&env::var("PROXIES").unwrap_or_default());
+        // INCLUDE_DIRECT=1 时把直连也作为一个出口，和代理一起轮询：
+        // 平时直连、直连被限流（429）后自动切到代理，冷却结束再回来。
+        let include_direct = env_flag("INCLUDE_DIRECT");
+        let mut entries = Vec::with_capacity(proxies.len() + 1);
+        if include_direct {
+            entries.push(ProxyEntry::direct());
+        }
+        entries.extend(proxies);
+        Self::new(entries, cooldown)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -63,14 +84,18 @@ impl ProxyPool {
         self.entries.iter().map(|entry| entry.url.clone()).collect()
     }
 
-    // 按下标取出口，用于预建每出口独立的 Agent。
-    pub fn proxy_at(&self, index: usize) -> Proxy {
+    // 按下标取出口，用于预建每出口独立的 Agent。None 表示直连。
+    pub fn proxy_at(&self, index: usize) -> Option<Proxy> {
         self.entries[index].proxy.clone()
     }
 
-    // 轮询挑一个当前不在冷却期的出口，返回下标与 Proxy 克隆。
+    pub fn entry_at(&self, index: usize) -> &ProxyEntry {
+        &self.entries[index]
+    }
+
+    // 轮询挑一个当前不在冷却期的出口，返回下标。
     // 全部处于冷却时退化为「选冷却最早结束的那个」，避免一次集中限流就彻底断流。
-    pub fn acquire(&self) -> Option<(usize, Proxy)> {
+    pub fn acquire(&self) -> Option<usize> {
         if self.entries.is_empty() {
             return None;
         }
@@ -91,10 +116,10 @@ impl ProxyPool {
                         fallback = Some((index, until));
                     }
                 }
-                _ => return Some((index, self.entries[index].proxy.clone())),
+                _ => return Some(index),
             }
         }
-        fallback.map(|(index, _)| (index, self.entries[index].proxy.clone()))
+        fallback.map(|(index, _)| index)
     }
 
     // 标记某个出口被限流，进入冷却期。冷却只延长不缩短，避免重复命中反复重置计时。
@@ -137,7 +162,7 @@ pub fn parse_proxies(value: &str) -> Vec<ProxyEntry> {
         .filter_map(|item| {
             Proxy::new(item).ok().map(|proxy| ProxyEntry {
                 url: item.to_owned(),
-                proxy,
+                proxy: Some(proxy),
             })
         })
         .collect();
@@ -154,6 +179,17 @@ pub fn env_seconds(name: &str, fallback: u64) -> Duration {
         .unwrap_or_else(|| Duration::from_secs(fallback))
 }
 
+pub fn env_flag(name: &str) -> bool {
+    env::var(name)
+        .map(|value| {
+            matches!(
+                value.to_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,7 +197,7 @@ mod tests {
     fn entry(url: &str) -> ProxyEntry {
         ProxyEntry {
             url: url.to_owned(),
-            proxy: Proxy::new(url).expect("valid proxy url"),
+            proxy: Some(Proxy::new(url).expect("valid proxy url")),
         }
     }
 
@@ -195,7 +231,7 @@ mod tests {
             parse_proxies("http://a.example:1,http://b.example:2,http://c.example:3"),
             Duration::from_secs(60),
         );
-        let picked: Vec<usize> = (0..6).map(|_| pool.acquire().unwrap().0).collect();
+        let picked: Vec<usize> = (0..6).map(|_| pool.acquire().unwrap()).collect();
         // 轮询：每个出口各命中两次，顺序在池内循环。
         assert_eq!(picked, vec![0, 1, 2, 0, 1, 2]);
     }
@@ -210,12 +246,12 @@ mod tests {
         assert_eq!(pool.available(), 1);
         // 冷却中的 0 号被跳过，只挑 1 号。
         for _ in 0..4 {
-            assert_eq!(pool.acquire().unwrap().0, 1);
+            assert_eq!(pool.acquire().unwrap(), 1);
         }
         std::thread::sleep(Duration::from_millis(200));
         // 冷却结束后重新参与轮询。
         assert_eq!(pool.available(), 2);
-        let picked: Vec<usize> = (0..2).map(|_| pool.acquire().unwrap().0).collect();
+        let picked: Vec<usize> = (0..2).map(|_| pool.acquire().unwrap()).collect();
         assert!(picked.contains(&0), "exit 0 should be back, got {picked:?}");
     }
 
@@ -254,5 +290,37 @@ mod tests {
         let pool = ProxyPool::new(parse_proxies("http://a.example:1"), Duration::from_secs(60));
         pool.penalize(99);
         assert_eq!(pool.available(), 1);
+    }
+
+    // 直连作为一个出口：直连优先，被限流后自动切到代理，冷却结束再回来。
+    #[test]
+    fn direct_exit_prefers_direct_then_fails_over_to_proxy() {
+        let mut entries = vec![ProxyEntry::direct()];
+        entries.extend(parse_proxies("http://a.example:1"));
+        let pool = ProxyPool::new(entries, Duration::from_millis(150));
+
+        assert!(pool.entry_at(0).is_direct());
+        assert!(pool.proxy_at(0).is_none());
+        assert!(pool.proxy_at(1).is_some());
+
+        // 直连被限流后，请求改走代理出口。
+        pool.penalize(0);
+        for _ in 0..3 {
+            assert_eq!(pool.acquire().unwrap(), 1);
+        }
+        assert_eq!(pool.available(), 1);
+
+        // 冷却结束后直连重新参与轮询。
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(pool.available(), 2);
+        let picked: Vec<usize> = (0..2).map(|_| pool.acquire().unwrap()).collect();
+        assert!(picked.contains(&0), "direct should be back, got {picked:?}");
+    }
+
+    // 未开启 INCLUDE_DIRECT 时，池里只有代理，不会回落到直连。
+    #[test]
+    fn direct_is_absent_unless_enabled() {
+        let entries = parse_proxies("http://a.example:1");
+        assert!(entries.iter().all(|e| !e.is_direct()));
     }
 }
