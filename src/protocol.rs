@@ -18,6 +18,53 @@ pub struct UpstreamError {
     pub status: u16,
     pub message: String,
     pub body: Vec<u8>,
+    // 上游原始响应头，用于把 Retry-After 之类的信息透传下去。
+    pub headers: Vec<(String, String)>,
+}
+
+impl UpstreamError {
+    pub fn new(status: u16, message: String, body: Vec<u8>) -> Self {
+        Self {
+            status,
+            message,
+            body,
+            headers: Vec::new(),
+        }
+    }
+
+    pub fn with_headers(mut self, headers: Vec<(String, String)>) -> Self {
+        self.headers = headers;
+        self
+    }
+
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+
+    // 上游给的重试等待秒数。支持整数秒；HTTP-date 形式上游目前不用，忽略。
+    pub fn retry_after(&self) -> Option<u64> {
+        self.header("retry-after")?
+            .trim()
+            .parse::<u64>()
+            .ok()
+    }
+}
+
+// 把上游响应头收集成 (名, 值) 列表，供错误路径透传。
+pub fn collect_headers(response: &http::Response<Vec<u8>>) -> Vec<(String, String)> {
+    response
+        .headers()
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str().to_owned(), value.to_owned()))
+        })
+        .collect()
 }
 
 pub const MAX_BODY_BYTES: u64 = 64 << 20;

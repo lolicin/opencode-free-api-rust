@@ -32,12 +32,26 @@ pub fn response(
     content_type: Option<&str>,
     cache_control: Option<&str>,
 ) -> ResponseBox {
-    let mut headers = Vec::with_capacity(4);
+    response_with_retry_after(status, body, content_type, cache_control, None)
+}
+
+// 带上游 Retry-After 的响应。客户端据此知道何时该重试，而不是盲目重发。
+pub fn response_with_retry_after(
+    status: u16,
+    body: Vec<u8>,
+    content_type: Option<&str>,
+    cache_control: Option<&str>,
+    retry_after: Option<&str>,
+) -> ResponseBox {
+    let mut headers = Vec::with_capacity(5);
     if let Some(value) = content_type {
         headers.push(header("Content-Type", value));
     }
     if let Some(value) = cache_control {
         headers.push(header("Cache-Control", value));
+    }
+    if let Some(value) = retry_after {
+        headers.push(header("Retry-After", value));
     }
     append_cors(&mut headers);
     let data_length = Some(body.len());

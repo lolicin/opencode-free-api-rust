@@ -25,14 +25,15 @@ mod routes;
 
 use crate::convert::{
     aggregate_sse, append_cors, bad_request, cors_response, error_response, header,
-    is_stream_request, json_response, response, thinking_mode, transform_stream_body,
+    is_stream_request, json_response, response, response_with_retry_after, thinking_mode,
+    transform_stream_body,
 };
 use crate::keepalive::{primary_ip, public_ip, spawn_session_keepalive, unix_now};
 use crate::pool::ProxyPool;
 use crate::protocol::{
     MAX_BODY_BYTES, UpstreamError, UpstreamResponse, add_headers, add_v2_session_headers,
-    add_token, client, client_with_proxy, env_flag, env_or, env_seconds, gate_tool,
-    read_body_response, request_header, split_nodes,
+    add_token, client, client_with_proxy, collect_headers, env_flag, env_or, env_seconds,
+    gate_tool, read_body_response, request_header, split_nodes,
 };
 use crate::routes::{
     is_chat_path, is_claude_models_path, is_health_path, is_models_path, normalize_path,
@@ -204,6 +205,7 @@ impl App {
                     "proxy_pool": {
                         "exits": self.pool.len(),
                         "available": self.pool.available(),
+                        "retired": self.pool.retired_count(),
                         "cooldown_secs": self.pool.cooldown().as_secs(),
                     },
                     "port": self.port,
@@ -421,12 +423,15 @@ impl App {
                 Response::new(StatusCode(status), headers, Cursor::new(body), None, None).boxed()
             }
             Err(error) => {
+                // 把上游的 Retry-After 透传给客户端，让它知道何时恢复再重试。
+                let retry_after = error.header("retry-after").map(str::to_owned);
                 if (400..500).contains(&error.status) && !error.body.is_empty() {
-                    response(
+                    response_with_retry_after(
                         error.status,
                         error.body,
                         Some("text/event-stream; charset=utf-8"),
                         None,
+                        retry_after.as_deref(),
                     )
                 } else {
                     error_response(error.status, "upstream_error", &error.message)
@@ -584,11 +589,11 @@ impl App {
         stream: bool,
     ) -> Result<UpstreamResponse, UpstreamError> {
         if self.nodes.is_empty() {
-            return Err(UpstreamError {
-                status: 502,
-                message: "no upstream nodes configured".to_string(),
-                body: Vec::new(),
-            });
+            return Err(UpstreamError::new(
+                502,
+                "no upstream nodes configured".to_string(),
+                Vec::new(),
+            ));
         }
         let mut failures = Vec::with_capacity(self.nodes.len());
         // 429 表示该出口 IP 的配额/速率被限流，换个出口重试；最多把池子轮一遍。
@@ -626,6 +631,12 @@ impl App {
                     Ok(response) => {
                         if !response.status().is_success() {
                             let status = response.status();
+                            // 先取头再取 body：into_body 会消耗掉 response。
+                            let upstream_headers = collect_headers(&response);
+                            let retry_after_secs = upstream_headers
+                                .iter()
+                                .find(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
+                                .and_then(|(_, value)| value.trim().parse::<u64>().ok());
                             let body_bytes = response.into_body();
                             let body_str = String::from_utf8_lossy(&body_bytes).trim().to_owned();
                             let message = if body_str.is_empty() {
@@ -634,24 +645,51 @@ impl App {
                                 format!("{node}: HTTP {status} - {body_str}")
                             };
                             eprintln!("上游请求失败 {message}");
-                            // 429：给这个出口打冷却标记，换下一个出口继续尝试。
                             if status.as_u16() == 429 {
+                                // 429：配额/速率限流。上游会带 Retry-After（实测指向下一个
+                                // UTC 0 点），按它精确冷却；没有就回落到默认时长。
                                 if let Some(index) = proxy_index {
-                                    self.pool.penalize(index);
+                                    match retry_after_secs {
+                                        Some(secs) => {
+                                            self.pool.penalize_for(
+                                                index,
+                                                Duration::from_secs(secs),
+                                            );
+                                            eprintln!(
+                                                "出口 {} 被限流，按上游 Retry-After 冷却 {secs}s 后恢复，切换下一个出口",
+                                                self.pool.entry_at(index).url
+                                            );
+                                        }
+                                        None => {
+                                            self.pool.penalize(index);
+                                            eprintln!(
+                                                "出口 {} 被限流，冷却后切换下一个出口",
+                                                self.pool.entry_at(index).url
+                                            );
+                                        }
+                                    }
+                                    failures.push(message.clone());
+                                    break;
+                                }
+                            }
+                            // 403 FreeTierError：出口 IP 类型不合格（实测机房 IP 必挂），
+                            // 等待不会恢复，直接剔除该出口。
+                            if status.as_u16() == 403 && is_free_tier_error(&body_str) {
+                                if let Some(index) = proxy_index {
+                                    self.pool.retire(index);
                                     eprintln!(
-                                        "出口 {} 被限流，冷却后切换下一个出口",
+                                        "出口 {} 返回 FreeTierError，已永久剔除（机房 IP 等多久都不会恢复）",
                                         self.pool.entry_at(index).url
                                     );
-                                    failures.push(message);
+                                    failures.push(message.clone());
                                     break;
                                 }
                             }
                             if status.is_client_error() {
-                                return Err(UpstreamError {
-                                    status: status.as_u16(),
-                                    message,
-                                    body: body_bytes,
-                                });
+                                return Err(
+                                    UpstreamError::new(status.as_u16(), message, body_bytes)
+                                        .with_headers(upstream_headers),
+                                );
                             }
                             failures.push(message);
                             continue;
@@ -682,11 +720,7 @@ impl App {
                 }
             }
         }
-        Err(UpstreamError {
-            status: 502,
-            message: failures.join("; "),
-            body: Vec::new(),
-        })
+        Err(UpstreamError::new(502, failures.join("; "), Vec::new()))
     }
 
     fn forward(&self, request: &mut HttpRequest, method: &Method, full_path: &str) -> ResponseBox {
@@ -793,6 +827,12 @@ impl App {
 fn is_rate_limited(error: &ureq::Error) -> bool {
     let text = error.to_string().to_lowercase();
     text.contains("429") || text.contains("too many requests") || text.contains("rate limit")
+}
+
+// 403 FreeTierError：客户端身份或出口 IP 不被认可。与 429 不同，等待不会恢复，
+// 因此对该出口直接剔除。
+fn is_free_tier_error(body: &str) -> bool {
+    body.contains("FreeTierError")
 }
 
 fn proxy_response(upstream: UpstreamResponse) -> ResponseBox {    let status = upstream.status().as_u16();
@@ -1095,7 +1135,50 @@ mod tests {
         assert!(!is_rate_limited(&unrelated));
     }
 
-    fn remap_gate_read_names(tools: &Value) -> Vec<String> {        tools
+    // 上游实测：429 带 Retry-After: 28699（指向下一个 UTC 0 点）。
+    #[test]
+    fn upstream_error_exposes_retry_after() {
+        let err = UpstreamError::new(
+            429,
+            "rate limited".to_owned(),
+            br#"{"type":"error","error":{"type":"FreeUsageLimitError"}}"#.to_vec(),
+        )
+        .with_headers(vec![
+            ("Retry-After".to_owned(), "28699".to_owned()),
+            ("Server".to_owned(), "cloudflare".to_owned()),
+        ]);
+        assert_eq!(err.retry_after(), Some(28699));
+        assert_eq!(err.header("retry-after"), Some("28699"));
+    }
+
+    #[test]
+    fn upstream_error_without_retry_after_is_none() {
+        let err = UpstreamError::new(500, "boom".to_owned(), Vec::new());
+        assert_eq!(err.retry_after(), None);
+        // 非数字（HTTP-date 形式）时不猜测，返回 None 交给默认冷却。
+        let dated = UpstreamError::new(429, "x".to_owned(), Vec::new()).with_headers(vec![(
+            "retry-after".to_owned(),
+            "Wed, 21 Oct 2026 07:28:00 GMT".to_owned(),
+        )]);
+        assert_eq!(dated.retry_after(), None);
+    }
+
+    // 403 的两种来源要分开：FreeTierError（剔除出口）vs 普通客户端错误（透传）。
+    #[test]
+    fn detects_free_tier_error_vs_other_errors() {
+        assert!(is_free_tier_error(
+            r#"{"type":"error","error":{"type":"FreeTierError","message":"..."}}"#
+        ));
+        assert!(!is_free_tier_error(
+            r#"{"type":"error","error":{"type":"RegionError"}}"#
+        ));
+        assert!(!is_free_tier_error(
+            r#"{"type":"error","error":{"type":"FreeUsageLimitError"}}"#
+        ));
+    }
+
+    fn remap_gate_read_names(tools: &Value) -> Vec<String> {
+        tools
             .as_array()
             .expect("tools should be an array")
             .iter()

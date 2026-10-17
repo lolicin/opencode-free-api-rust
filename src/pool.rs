@@ -38,6 +38,8 @@ pub struct ProxyPool {
     entries: Vec<ProxyEntry>,
     // 与 entries 同下标的冷却截止时间；None 表示可用。
     cooldowns: Mutex<Vec<Option<Instant>>>,
+    // 永久剔除的出口下标（403 FreeTierError，等也不会恢复）。
+    retired: Mutex<Vec<usize>>,
     // 轮询游标，跨工作线程共享。
     next: AtomicUsize,
     cooldown: Duration,
@@ -49,6 +51,7 @@ impl ProxyPool {
         Self {
             entries,
             cooldowns: Mutex::new(cooldowns),
+            retired: Mutex::new(Vec::new()),
             next: AtomicUsize::new(0),
             cooldown,
         }
@@ -102,10 +105,16 @@ impl ProxyPool {
         let len = self.entries.len();
         let start = self.next.fetch_add(1, Ordering::Relaxed) % len;
         let now = Instant::now();
+        let retired = self.retired.lock().expect("proxy pool lock").clone();
+        // 所有出口都被剔除时不再拦截，交给上游裁决，避免把自己锁死成完全不可用。
+        let all_retired = retired.len() >= len;
         let cooldowns = self.cooldowns.lock().expect("proxy pool lock");
         let mut fallback: Option<(usize, Instant)> = None;
         for offset in 0..len {
             let index = (start + offset) % len;
+            if !all_retired && retired.contains(&index) {
+                continue;
+            }
             match cooldowns[index] {
                 Some(until) if until > now => {
                     let earlier = match fallback {
@@ -124,11 +133,17 @@ impl ProxyPool {
 
     // 标记某个出口被限流，进入冷却期。冷却只延长不缩短，避免重复命中反复重置计时。
     pub fn penalize(&self, index: usize) {
+        self.penalize_for(index, self.cooldown);
+    }
+
+    // 按指定时长冷却。上游 429 会给出 Retry-After（实测指向下一个 UTC 0 点），
+    // 用它比默认时常更准；拿不到时调用方回落到 penalize。
+    pub fn penalize_for(&self, index: usize, duration: Duration) {
         let mut cooldowns = self.cooldowns.lock().expect("proxy pool lock");
         if index >= cooldowns.len() {
             return;
         }
-        let until = Instant::now() + self.cooldown;
+        let until = Instant::now() + duration;
         let should_extend = match cooldowns[index] {
             Some(existing) => until > existing,
             None => true,
@@ -138,17 +153,56 @@ impl ProxyPool {
         }
     }
 
-    // 当前可用（不在冷却期）的出口数，用于可观测性。
+    // 永久剔除某个出口。用于 403 FreeTierError：这是出口 IP 类型不合格
+    // （实测机房 IP 必挂），等多久都不会恢复，继续轮询只会浪费请求。
+    pub fn retire(&self, index: usize) {
+        let mut retired = self.retired.lock().expect("proxy pool lock");
+        if index < self.entries.len() && !retired.contains(&index) {
+            retired.push(index);
+        }
+    }
+
+    pub fn is_retired(&self, index: usize) -> bool {
+        self.retired
+            .lock()
+            .expect("proxy pool lock")
+            .contains(&index)
+    }
+
+    pub fn retired_count(&self) -> usize {
+        self.retired.lock().expect("proxy pool lock").len()
+    }
+
+    // 当前可用（不在冷却期、且未被剔除）的出口数，用于可观测性。
     pub fn available(&self) -> usize {
         let now = Instant::now();
+        let retired = self.retired.lock().expect("proxy pool lock").clone();
         let cooldowns = self.cooldowns.lock().expect("proxy pool lock");
         cooldowns
             .iter()
-            .filter(|slot| match slot {
-                Some(until) => *until <= now,
-                None => true,
+            .enumerate()
+            .filter(|(index, slot)| {
+                if retired.contains(index) {
+                    return false;
+                }
+                match slot {
+                    Some(until) => *until <= now,
+                    None => true,
+                }
             })
             .count()
+    }
+
+    // 距离该出口恢复还要多久，供日志与 /health 使用。
+    pub fn cooldown_remaining(&self, index: usize) -> Option<Duration> {
+        let cooldowns = self.cooldowns.lock().expect("proxy pool lock");
+        let until = (*cooldowns.get(index)?)?;
+        let now = Instant::now();
+        if until > now {
+            Some(until - now)
+        } else {
+            None
+        }
     }
 }
 
@@ -322,5 +376,90 @@ mod tests {
     fn direct_is_absent_unless_enabled() {
         let entries = parse_proxies("http://a.example:1");
         assert!(entries.iter().all(|e| !e.is_direct()));
+    }
+
+    // 上游给 Retry-After（实测 28699 秒 → 下一个 UTC 0 点）时按它冷却。
+    #[test]
+    fn penalize_for_honours_upstream_retry_after() {
+        let pool = ProxyPool::new(
+            parse_proxies("http://a.example:1,http://b.example:2"),
+            Duration::from_secs(60),
+        );
+        pool.penalize_for(0, Duration::from_secs(28699));
+        // 冷却时长应远超默认的 60 秒。
+        let remaining = pool.cooldown_remaining(0).expect("should be cooling");
+        assert!(
+            remaining > Duration::from_secs(28000),
+            "expected ~28699s cooldown, got {remaining:?}"
+        );
+        // 冷却中的出口不被选中。
+        for _ in 0..4 {
+            assert_eq!(pool.acquire().unwrap(), 1);
+        }
+        assert_eq!(pool.available(), 1);
+    }
+
+    #[test]
+    fn cooldown_expires_and_exit_returns() {
+        let pool = ProxyPool::new(
+            parse_proxies("http://a.example:1,http://b.example:2"),
+            Duration::from_secs(60),
+        );
+        pool.penalize_for(0, Duration::from_millis(120));
+        assert_eq!(pool.available(), 1);
+        assert!(pool.cooldown_remaining(0).is_some());
+        std::thread::sleep(Duration::from_millis(180));
+        assert_eq!(pool.available(), 2);
+        assert!(pool.cooldown_remaining(0).is_none(), "cooldown should be over");
+        let picked: Vec<usize> = (0..2).map(|_| pool.acquire().unwrap()).collect();
+        assert!(picked.contains(&0));
+    }
+
+    // 403 FreeTierError 是 IP 类型不合格，等待无用 → 永久剔除。
+    #[test]
+    fn retired_exit_is_never_selected() {
+        let pool = ProxyPool::new(
+            parse_proxies("http://dc.example:1,http://home.example:2"),
+            Duration::from_secs(60),
+        );
+        pool.retire(0);
+        assert!(pool.is_retired(0));
+        assert_eq!(pool.retired_count(), 1);
+        assert_eq!(pool.available(), 1);
+        for _ in 0..5 {
+            assert_eq!(pool.acquire().unwrap(), 1, "retired exit must not be picked");
+        }
+    }
+
+    #[test]
+    fn retiring_the_same_exit_twice_is_idempotent() {
+        let pool = ProxyPool::new(
+            parse_proxies("http://a.example:1,http://b.example:2"),
+            Duration::from_secs(60),
+        );
+        pool.retire(0);
+        pool.retire(0);
+        assert_eq!(pool.retired_count(), 1);
+    }
+
+    // 全部出口都被剔除时不能把池子锁死，仍要给出一个出口交给上游裁决。
+    #[test]
+    fn all_retired_still_yields_an_exit() {
+        let pool = ProxyPool::new(
+            parse_proxies("http://a.example:1,http://b.example:2"),
+            Duration::from_secs(60),
+        );
+        pool.retire(0);
+        pool.retire(1);
+        assert_eq!(pool.available(), 0);
+        assert!(pool.acquire().is_some(), "must not deadlock when all retired");
+    }
+
+    #[test]
+    fn retire_out_of_range_is_ignored() {
+        let pool = ProxyPool::new(parse_proxies("http://a.example:1"), Duration::from_secs(60));
+        pool.retire(42);
+        assert_eq!(pool.retired_count(), 0);
+        assert_eq!(pool.available(), 1);
     }
 }
